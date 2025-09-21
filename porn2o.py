@@ -2,9 +2,10 @@ import os
 import sys
 import platform
 import html
+from dataclasses import dataclass, field
 
 # venv check - перезапуск если нужно
-if platform.system() == "Windows":
+if PLATFORM_SYSTEM == "Windows":
     venv_py = os.path.join(os.path.dirname(__file__), ".venv", "Scripts", "python.exe")
 else:
     venv_py = os.path.join(os.path.dirname(__file__), ".venv", "bin", "python")
@@ -26,7 +27,7 @@ import hashlib
 import secrets
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, MutableMapping, Optional, Tuple
 import requests
 import logging
 import ctypes
@@ -37,9 +38,12 @@ from telethon.errors import FloodWaitError
 from rich.console import Console
 from rich.panel import Panel
 from rich.style import Style
+
+PLATFORM_SYSTEM = platform.system()
+logger = logging.getLogger(__name__)
 # utf8 fix для винды
 try:
-    if platform.system() == "Windows":
+    if PLATFORM_SYSTEM == "Windows":
         try:
             import ctypes
             ctypes.windll.kernel32.SetConsoleOutputCP(65001)
@@ -56,89 +60,266 @@ try:
 except:
     pass
 # загрузка конфига
-def load_config(config_file: str = "config.txt"):
-    # читаем config.txt
-    import os
-    import re
-    from typing import Dict, Any
-    
-    if not os.path.exists(config_file):
-        # создаем шаблон если нет
+
+CONFIG_TEMPLATE = """# config.txt
+API_ID=123456
+API_HASH=your_api_hash
+PHONE=+79990000000
+BOT=@your_bot_username
+SESSION=final_session
+PRODUCT_LINK=c_xxx
+VERBOSE=false
+PREEMPTIVE_QTY=true
+START_INTERVAL=1.5
+QTY_PRE_DELAY=1.0
+RETRIES_MAX=3
+RETRIES_BASE=0.15
+RETRIES_JITTER=0.05
+"""
+
+
+class ConfigError(RuntimeError):
+    """Ошибка парсинга config.txt"""
+
+
+def _ensure_parent_dir(path: Path) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        logger.debug("Не удалось создать каталог для %s: %s", path, exc)
+
+
+def _bool_from_str(value: str) -> bool:
+    return value.strip().lower() in {"1", "true", "yes", "y", "on", "да", "д"}
+
+
+def _coerce_int(value: str, field_name: str) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"Поле {field_name} должно быть целым числом") from exc
+
+
+def _coerce_float(value: str, field_name: str) -> float:
+    try:
+        return float(str(value).replace(",", "."))
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"Поле {field_name} должно быть числом") from exc
+
+
+class RetriesConfig(MutableMapping[str, float]):
+    __slots__ = ("max", "base", "jitter")
+
+    def __init__(self, max: int = 3, base: float = 0.15, jitter: float = 0.05) -> None:
+        self.max = int(max)
+        self.base = float(base)
+        self.jitter = float(jitter)
+
+    @staticmethod
+    def _normalize_key(key: str) -> str:
+        norm = (key or "").strip().lower()
+        if norm not in {"max", "base", "jitter"}:
+            raise KeyError(key)
+        return norm
+
+    def __getitem__(self, key: str) -> float:
+        attr = self._normalize_key(key)
+        return getattr(self, attr)
+
+    def __setitem__(self, key: str, value: float) -> None:
+        attr = self._normalize_key(key)
+        if attr == "max":
+            self.max = int(value)
+        else:
+            setattr(self, attr, float(value))
+
+    def __delitem__(self, key: str) -> None:
+        raise TypeError("Удаление параметров RETRIES запрещено")
+
+    def __iter__(self) -> Iterator[str]:
+        yield from ("max", "base", "jitter")
+
+    def __len__(self) -> int:
+        return 3
+
+    def to_dict(self) -> Dict[str, float]:
+        return {"max": self.max, "base": self.base, "jitter": self.jitter}
+
+
+@dataclass
+class AppConfig:
+    api_id: int
+    api_hash: str
+    phone: str
+    bot: str
+    session: str
+    product_link: Optional[str] = None
+    verbose: bool = False
+    preemptive_qty: bool = True
+    start_interval: float = 1.5
+    qty_pre_delay: float = 1.0
+    retries: RetriesConfig = field(default_factory=RetriesConfig)
+
+
+class ConfigAdapter(MutableMapping[str, Any]):
+    __slots__ = ("_config",)
+
+    _SUPPORTED_KEYS = {
+        "api_id": "api_id",
+        "api_hash": "api_hash",
+        "phone": "phone",
+        "bot": "bot",
+        "session": "session",
+        "product_link": "product_link",
+        "verbose": "verbose",
+        "preemptive_qty": "preemptive_qty",
+        "start_interval": "start_interval",
+        "qty_pre_delay": "qty_pre_delay",
+        "retries": "retries",
+    }
+
+    def __init__(self, config: AppConfig) -> None:
+        self._config = config
+
+    @classmethod
+    def _attr(cls, key: str) -> str:
+        lookup = cls._SUPPORTED_KEYS.get((key or "").strip().lower())
+        if not lookup:
+            raise KeyError(key)
+        return lookup
+
+    def __getitem__(self, key: str) -> Any:
+        attr = self._attr(key)
+        value = getattr(self._config, attr)
+        return value
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        attr = self._attr(key)
+        if attr == "retries":
+            if isinstance(value, RetriesConfig):
+                self._config.retries = value
+            elif isinstance(value, MutableMapping):
+                retries = self._config.retries
+                retries.max = int(value.get("max", retries.max))
+                retries.base = float(value.get("base", retries.base))
+                retries.jitter = float(value.get("jitter", retries.jitter))
+            else:
+                raise TypeError("Неверный тип для RETRIES")
+            return
+
+        if attr in {"api_id"}:
+            setattr(self._config, attr, _coerce_int(value, key))
+        elif attr in {"start_interval", "qty_pre_delay"}:
+            setattr(self._config, attr, _coerce_float(value, key))
+        elif attr in {"preemptive_qty", "verbose"}:
+            if isinstance(value, str):
+                setattr(self._config, attr, _bool_from_str(value))
+            else:
+                setattr(self._config, attr, bool(value))
+        else:
+            setattr(self._config, attr, value)
+
+    def __delitem__(self, key: str) -> None:
+        raise TypeError("Удаление параметров конфигурации запрещено")
+
+    def __iter__(self) -> Iterator[str]:
+        for key in self._SUPPORTED_KEYS:
+            yield key.upper()
+
+    def __len__(self) -> int:
+        return len(self._SUPPORTED_KEYS)
+
+    def get(self, key: str, default: Any = None) -> Any:  # type: ignore[override]
         try:
-            os.makedirs(os.path.dirname(config_file) or ".", exist_ok=True)
-            with open(config_file, "w", encoding="utf-8") as f:
-                f.write("# config.txt\nAPI_ID=123456\nAPI_HASH=your_api_hash\nPHONE=+79990000000\nBOT=@your_bot_username\nSESSION=finsal_session\nPRODUCT_LINK=c_xxx\nVERBOSE=false\nPREEMPTIVE_QTY=true\nSTART_INTERVAL=1.5\nQTY_PRE_DELAY=1.0\nRETRIES_MAX=3\nRETRIES_BASE=0.15\nRETRIES_JITTER=0.05\n")
-        except:
-            pass
+            return self[key]
+        except KeyError:
+            return default
+
+    def as_dict(self) -> Dict[str, Any]:
+        data = {name.upper(): getattr(self._config, attr) for name, attr in self._SUPPORTED_KEYS.items()}
+        retries = self._config.retries
+        data["RETRIES"] = retries.to_dict() if isinstance(retries, RetriesConfig) else RetriesConfig().to_dict()
+        return data
+
+
+def setup_logging(verbose: bool) -> None:
+    level = logging.DEBUG if verbose else logging.INFO
+    root = logging.getLogger()
+    if not root.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+        root.addHandler(handler)
+    root.setLevel(level)
+
+
+def load_config(config_file: str = "config.txt") -> Tuple[ConfigAdapter, Dict[str, Dict[str, str]]]:
+    config_path = Path(config_file)
+
+    if not config_path.exists():
+        _ensure_parent_dir(config_path)
+        config_path.write_text(CONFIG_TEMPLATE, encoding="utf-8")
         raise FileNotFoundError(f"нет файла {config_file} - создан шаблон, заполни и запусти снова")
-    
-    config = {}
-    products = {}
-    
-    with open(config_file, 'r', encoding='utf-8') as f:
+
+    raw: Dict[str, str] = {}
+    retries_raw: Dict[str, str] = {}
+    products: Dict[str, Dict[str, str]] = {}
+
+    with config_path.open("r", encoding="utf-8") as f:
         for line_num, line in enumerate(f, 1):
-            line = line.strip()
-            
-            if not line or line.startswith('#'):
+            text = line.strip()
+            if not text or text.startswith("#"):
                 continue
-            
-            if '=' not in line:
+            if "=" not in text:
+                logger.debug("Пропущена строка %s без '=': %s", line_num, text)
                 continue
-                
-            key, value = line.split('=', 1)
+            key, value = text.split("=", 1)
             key = key.strip()
             value = value.strip()
-            
-            # товары
-            if key.startswith('PRODUCT_'):
-                product_id = key.replace('PRODUCT_', '')
-                if '|' in value:
-                    name, link = value.split('|', 1)
-                    products[product_id] = {
-                        "name": name.strip(),
-                        "link": link.strip()
-                    }
+
+            if key.startswith("PRODUCT_"):
+                product_id = key.replace("PRODUCT_", "", 1)
+                if "|" not in value:
+                    logger.warning("Строка товара %s без разделителя '|': %s", product_id, text)
+                    continue
+                name, link = value.split("|", 1)
+                products[product_id] = {"name": name.strip(), "link": link.strip()}
                 continue
-            
-            # retries
-            if key.startswith('RETRIES_'):
-                if 'retries' not in config:
-                    config['retries'] = {}
-                retries_key = key.replace('RETRIES_', '').lower()
-                if retries_key == 'max':
-                    config['retries']['max'] = int(value)
-                elif retries_key == 'base':
-                    config['retries']['base'] = float(value)
-                elif retries_key == 'jitter':
-                    config['retries']['jitter'] = float(value)
+
+            if key.startswith("RETRIES_"):
+                retries_raw[key.replace("RETRIES_", "", 1).lower()] = value
                 continue
-            
-            # типы данных тут
-            if value.lower() in ('true', 'false'):
-                config[key.lower()] = value.lower() == 'true'
-            elif value.isdigit():
-                config[key.lower()] = int(value)
-            elif re.match(r'^\d+\.\d+$', value):
-                config[key.lower()] = float(value)
-            else:
-                config[key.lower()] = value
-    
-    # собираем конфиг
-    result = {
-        "API_ID": config.get('api_id'),
-        "API_HASH": config.get('api_hash'),
-        "PHONE": config.get('phone'),
-        "BOT": config.get('bot'),
-        "SESSION": config.get('session'),
-        "PRODUCT_LINK": config.get('product_link'),
-        "VERBOSE": config.get('verbose', False),
-        "PREEMPTIVE_QTY": config.get('preemptive_qty', True),
-        "START_INTERVAL": config.get('start_interval', 1.5),
-        "QTY_PRE_DELAY": config.get('qty_pre_delay', 1.0),
-        "RETRIES": config.get('retries', {"max": 3, "base": 0.15, "jitter": 0.05}),
-    }
-    
-    return result, products
+
+            raw[key.upper()] = value
+
+    required = ["API_ID", "API_HASH", "PHONE", "BOT", "SESSION"]
+    missing = [key for key in required if key not in raw]
+    if missing:
+        raise ConfigError(f"Отсутствуют обязательные параметры: {', '.join(missing)}")
+
+    retries = RetriesConfig(
+        max=_coerce_int(retries_raw.get("max", 3), "RETRIES_MAX"),
+        base=_coerce_float(retries_raw.get("base", 0.15), "RETRIES_BASE"),
+        jitter=_coerce_float(retries_raw.get("jitter", 0.05), "RETRIES_JITTER"),
+    )
+
+    config = AppConfig(
+        api_id=_coerce_int(raw["API_ID"], "API_ID"),
+        api_hash=str(raw["API_HASH"]),
+        phone=str(raw["PHONE"]),
+        bot=str(raw["BOT"]),
+        session=str(raw["SESSION"]),
+        product_link=raw.get("PRODUCT_LINK"),
+        verbose=_bool_from_str(raw.get("VERBOSE", "false")),
+        preemptive_qty=_bool_from_str(raw.get("PREEMPTIVE_QTY", "true")),
+        start_interval=_coerce_float(raw.get("START_INTERVAL", 1.5), "START_INTERVAL"),
+        qty_pre_delay=_coerce_float(raw.get("QTY_PRE_DELAY", 1.0), "QTY_PRE_DELAY"),
+        retries=retries,
+    )
+
+    logger.debug("Конфигурация загружена: %s", config)
+    logger.debug("Найдено товаров: %s", len(products))
+
+    return ConfigAdapter(config), products
 
 # лицензии настройки
 LICENSE_SERVER_URL = "https://autobuy.cloudpub.ru"
@@ -287,7 +468,7 @@ class LicenseClient:
         # http настройки
         self.session = requests.Session()
         self.session.headers.update({
-            'User-Agent': f'Porn2oAutoBuyer/{self.client_version} ({platform.system()})',
+            'User-Agent': f'Porn2oAutoBuyer/{self.client_version} ({PLATFORM_SYSTEM})',
             'Content-Type': 'application/json'
         })
         
@@ -300,7 +481,7 @@ class LicenseClient:
     
     def get_config_dir(self) -> Path:
         # папка для конфига
-        if platform.system() == "Windows":
+        if PLATFORM_SYSTEM == "Windows":
             try:
                 if getattr(sys, "frozen", False):
                     return Path(sys.executable).parent
@@ -308,7 +489,7 @@ class LicenseClient:
                 pass
             appdata = os.getenv("APPDATA", os.path.expanduser("~"))
             return Path(appdata) / "Porn2oAutoBuyer"
-        elif platform.system() == "Darwin":
+        elif PLATFORM_SYSTEM == "Darwin":
             return Path.home() / "Library" / "Application Support" / "Porn2oAutoBuyer"
         else:
             config_home = os.getenv("XDG_CONFIG_HOME", Path.home() / ".config")
@@ -318,7 +499,7 @@ class LicenseClient:
         # сохраняем данные
         try:
             # виндовс dpapi
-            if platform.system() == "Windows":
+            if PLATFORM_SYSTEM == "Windows":
                 try:
                     import win32crypt
                     json_data = json.dumps(data, indent=2)
@@ -342,7 +523,7 @@ class LicenseClient:
             with open(filepath, 'w') as f:
                 json.dump(data, f, indent=2)
             
-            if platform.system() != "Windows":
+            if PLATFORM_SYSTEM != "Windows":
                 filepath.chmod(0o600)
                 
         except Exception as e:
@@ -403,7 +584,7 @@ class LicenseClient:
         try:
             # зашифрованный файл
             encrypted_file = filepath.with_suffix('.enc')
-            if encrypted_file.exists() and platform.system() == "Windows":
+            if encrypted_file.exists() and PLATFORM_SYSTEM == "Windows":
                 try:
                     import win32crypt
                     with open(encrypted_file, 'rb') as f:
@@ -449,7 +630,7 @@ class LicenseClient:
     def collect_hwid(self) -> Tuple[str, Dict]:
         # собираем hwid
         import re as _re
-        system = platform.system()
+        system = PLATFORM_SYSTEM
         try:
             import psutil as _psutil  # type: ignore
         except Exception:
@@ -989,6 +1170,8 @@ class FinalAutoBuyer:
         # Загружаем конфигурацию из config.txt рядом с exe/скриптом
         config_path = str(_run_dir().joinpath("config.txt"))
         self.config, self.products = load_config(config_path)
+        setup_logging(bool(self.config.get("VERBOSE", False)))
+        logger.debug("Загружено %s преднастроенных товаров", len(self.products))
 
         self.client: Optional[TelegramClient] = None
         self.quantity: Optional[str] = None
@@ -1179,7 +1362,7 @@ class FinalAutoBuyer:
         console.print("[green]✅ Лицензия действительна. Продолжаем...[/]")
 
         # uvloop недоступен на Windows; включаем, если можно
-        if platform.system().lower() != "windows":
+        if PLATFORM_SYSTEM.lower() != "windows":
             try:
                 import uvloop  # type: ignore
 
@@ -2929,8 +3112,16 @@ def _check_debug_environment():
 if __name__ == "__main__":
     # Проверка на отладчики
     _check_debug_environment()
-    
-    bot = FinalAutoBuyer()
+
+    try:
+        bot = FinalAutoBuyer()
+    except FileNotFoundError as e:
+        console.print(f"[red]{e}[/]")
+        sys.exit(1)
+    except ConfigError as e:
+        console.print(f"[red]Ошибка конфигурации: {e}[/]")
+        sys.exit(1)
+
     try:
         asyncio.run(bot.start())
     except KeyboardInterrupt:
